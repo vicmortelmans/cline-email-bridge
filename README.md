@@ -17,8 +17,11 @@ Cline global/project rules and skills.
   unless `--retry-failed` is supplied.
 - Uses a filesystem lock to prevent overlapping cron invocations.
 
-It does not send a reply email yet. The final Cline response is stored as
-`run-NNN/result.md`.
+It does not send a reply email itself. The final Cline response is stored as
+`run-NNN/result.md`. Replies, if the message asks for one, are sent by the Cline
+task itself through the `msmtp-mail` skill in bridge-reply mode
+(`send_mail.sh --reply-to-task <task dir> --send`), which locks the recipient to
+the verified sender recorded in `metadata.json`.
 
 ## Install
 
@@ -124,4 +127,7 @@ and skills. No business-specific classification is implemented in Python.
 - A process crash after Cline has started but before the message is marked read
   can lead to a repeat run on the next invocation. Check `metadata.json` and
   Cline history before retrying such cases.
-- No SMTP reply is sent in this version; results are saved locally.
+- No SMTP code in the bridge; a reply is sent by the Cline task itself via the
+  `msmtp-mail` skill, to the verified sender only, at most once per message.
+- `metadata.json` carries `reply.allowed`, `reply.sender` and `reply.max_replies`;
+  the skill and the CLI prompt refuse to reply when `reply.allowed` is not true.
