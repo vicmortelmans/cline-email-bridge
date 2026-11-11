@@ -130,6 +130,20 @@ def extract_message(raw: bytes, task_dir: Path) -> dict[str, Any]:
         (task_dir / "body.html").write_text(body_html, encoding="utf-8")
 
     sender = parseaddr(str(msg.get("From", "")))[1].strip().lower()
+
+    # Automated messages must never be answered (mail loops). RFC 3834 plus the
+    # traditional bulk/auto-reply markers.
+    auto_submitted = str(msg.get("Auto-Submitted", "")).strip()
+    precedence = str(msg.get("Precedence", "")).strip().lower()
+    list_id = str(msg.get("List-Id", "")).strip()
+    automated_reason = ""
+    if auto_submitted and auto_submitted.split(";")[0].strip().lower() != "no":
+        automated_reason = f"Auto-Submitted: {auto_submitted}"
+    elif precedence in {"bulk", "junk", "list", "auto_reply", "auto-reply"}:
+        automated_reason = f"Precedence: {precedence}"
+    elif list_id:
+        automated_reason = "List-Id aanwezig"
+
     metadata = {
         "subject": str(msg.get("Subject", "")),
         "from": str(msg.get("From", "")),
@@ -143,7 +157,13 @@ def extract_message(raw: bytes, task_dir: Path) -> dict[str, Any]:
         # Set to true only after the sender passed ALLOWED_SENDERS (see process_one).
         # The msmtp-mail skill may send at most one reply to this address, and only
         # to this address.
-        "reply": {"allowed": False, "sender": sender, "max_replies": 1},
+        "reply": {
+            "allowed": False,
+            "sender": sender,
+            "max_replies": 1,
+            "automated_reason": automated_reason,
+            "dkim": "unknown",
+        },
         "runs": [],
     }
     (task_dir / "metadata.json").write_text(
@@ -165,6 +185,41 @@ def save_metadata(path: Path, metadata: dict[str, Any]) -> None:
 
 def check_sender(sender: str, allowed_senders: set[str]) -> bool:
     return bool(sender) and sender.lower() in allowed_senders
+
+
+def verify_dkim(raw: bytes) -> str:
+    """Verify the message's DKIM signature.
+
+    Returns "pass", "fail", "none" (unsigned), "error" (bad signature/DNS) or
+    "unavailable" when the optional dkimpy dependency is not installed.
+    """
+    if b"DKIM-Signature:" not in raw:
+        return "none"
+    try:
+        import dkim  # optional dependency
+    except ImportError:
+        LOG.warning("dkimpy is not installed; DKIM is not verified (pip install dkimpy)")
+        return "unavailable"
+    try:
+        return "pass" if dkim.verify(raw) else "fail"
+    except Exception as exc:  # DNS problems, malformed signature, key too short...
+        LOG.debug("DKIM verification error: %s", exc)
+        return "error"
+
+
+def replies_sent_today(tasks_dir: Path) -> int:
+    """Count replies already sent today, based on the skill's reply-sent.json markers."""
+    today = datetime.now(timezone.utc).date()
+    count = 0
+    for marker in tasks_dir.glob("*/reply-sent.json"):
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            sent = datetime.fromisoformat(str(data["sent_at_utc"])).astimezone(timezone.utc).date()
+        except Exception:
+            sent = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc).date()
+        if sent == today:
+            count += 1
+    return count
 
 
 def make_prompt(task_dir: Path, metadata: dict[str, Any]) -> str:
@@ -299,6 +354,8 @@ def process_one(
     tasks_dir: Path,
     processed_folder: str,
     allowed_senders: set[str],
+    require_dkim: set[str],
+    max_replies_per_day: int,
     cline_bin: str,
     provider: str,
     model: str,
@@ -342,11 +399,33 @@ def process_one(
 
     # The sender is verified against ALLOWED_SENDERS: allow exactly one reply, and
     # only to the address recorded here (never to addresses found in the message).
+    # Additional guards: never answer automated messages, optionally require DKIM for
+    # known sender domains, and stop after MAX_REPLIES_PER_DAY replies.
     reply_info = metadata.setdefault("reply", {})
-    reply_info["allowed"] = True
     reply_info["sender"] = metadata.get("sender_address", "")
     reply_info.setdefault("max_replies", 1)
+
+    blockers: list[str] = []
+    automated_reason = str(reply_info.get("automated_reason") or "")
+    if automated_reason:
+        blockers.append(f"automatisch bericht ({automated_reason})")
+
+    dkim_result = verify_dkim(raw)
+    reply_info["dkim"] = dkim_result
+    sender_domain = reply_info["sender"].rsplit("@", 1)[-1].lower()
+    if sender_domain in require_dkim and dkim_result != "pass":
+        blockers.append(f"domein {sender_domain} vereist DKIM (nu: {dkim_result})")
+
+    replies_today = replies_sent_today(tasks_dir)
+    reply_info["replies_sent_today"] = replies_today
+    if max_replies_per_day > 0 and replies_today >= max_replies_per_day:
+        blockers.append(f"dagelijkse limiet bereikt ({replies_today}/{max_replies_per_day})")
+
+    reply_info["allowed"] = not blockers
+    reply_info["blocked_by"] = blockers
     save_metadata(metadata_path, metadata)
+    LOG.info("UID %s: dkim=%s, reply.allowed=%s%s", uid, dkim_result, reply_info["allowed"],
+             "" if not blockers else f" ({'; '.join(blockers)})")
 
     if dry_run:
         LOG.info("DRY RUN: saved %s but did not start Cline or mark it processed", task_dir)
@@ -434,6 +513,15 @@ def main() -> int:
         if not allowed_senders:
             raise RuntimeError("Set ALLOWED_SENDERS to one or more trusted sender email addresses.")
 
+        # Domains for which a reply requires a passing DKIM signature (comma-separated).
+        # Empty means: verify and log DKIM, but do not block replies on it.
+        require_dkim = {
+            domain.strip().lower().lstrip("@")
+            for domain in os.getenv("REQUIRE_DKIM", "").split(",")
+            if domain.strip()
+        }
+        max_replies_per_day = int(os.getenv("MAX_REPLIES_PER_DAY", "10"))
+
         if not workdir.is_dir():
             raise RuntimeError(f"CLINE_WORKDIR does not exist or is not a directory: {workdir}")
         tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +553,8 @@ def main() -> int:
                     try:
                         process_one(
                             client, uid, uidvalidity, tasks_dir, processed_folder,
-                            allowed_senders, cline_bin, provider, model, workdir,
+                            allowed_senders, require_dkim, max_replies_per_day,
+                            cline_bin, provider, model, workdir,
                             timeout, auto_approve, args.retry_failed, args.dry_run,
                         )
                     except Exception:

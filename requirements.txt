@@ -1,2 +1,4 @@
 IMAPClient==3.1.0
 python-dotenv==1.2.4
+# Optional but recommended: verifies the DKIM signature of incoming mail.
+dkimpy==1.1.8

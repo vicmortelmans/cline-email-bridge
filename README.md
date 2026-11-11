@@ -131,3 +131,11 @@ and skills. No business-specific classification is implemented in Python.
   `msmtp-mail` skill, to the verified sender only, at most once per message.
 - `metadata.json` carries `reply.allowed`, `reply.sender` and `reply.max_replies`;
   the skill and the CLI prompt refuse to reply when `reply.allowed` is not true.
+- `reply.allowed` also becomes false for automated messages (`Auto-Submitted`,
+  `Precedence: bulk|auto_reply|list`, `List-Id`), when the sender domain is listed
+  in `REQUIRE_DKIM` without a passing DKIM signature, and once
+  `MAX_REPLIES_PER_DAY` replies have been sent that day. The reason is stored in
+  `reply.blocked_by`.
+- DKIM is verified with `dkimpy` when installed; without it the result is
+  `unavailable` and only logged (unless the domain is in `REQUIRE_DKIM`, in which
+  case replies are blocked).
