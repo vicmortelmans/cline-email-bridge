@@ -79,6 +79,33 @@ If a task fails, inspect its `run-NNN/stdout.jsonl`, `stderr.log`, and
 .venv/bin/python cline_email_bridge.py --retry-failed --limit 1
 ```
 
+To process one specific message, even if it is no longer marked unread (for
+example after a failure where the server flagged it `\Seen`):
+
+```bash
+.venv/bin/python cline_email_bridge.py --uid 8
+```
+
+### Running from cron
+
+cron starts jobs with a minimal `PATH` (`/usr/bin:/bin`). A bare
+`CLINE_BIN=cline` therefore fails with
+`FileNotFoundError: [Errno 2] No such file or directory: 'cline'`, and Cline
+never starts: `stdout.jsonl` and `stderr.log` stay empty and there is no Cline
+session history. Node installed through nvm is invisible for the same reason.
+
+Point `CLINE_BIN` at `bin/cline-nvm` (this repository) instead; it prepends the
+nvm node bin directory to `PATH` and then execs the Cline CLI:
+
+```bash
+CLINE_BIN=/home/you/path/to/cline-email-bridge/bin/cline-nvm
+```
+
+Set `CLINE_NODE_BIN` if your nvm node version directory differs. The bridge log
+(`$TASKS_DIR/cline-email-bridge.log`) shows the traceback for these failures, and
+from now on the reason is also written to the run's `result.md` and
+`stderr.log`.
+
 The original message remains unread after failure. If the message is marked
 `rejected_sender`, correct `ALLOWED_SENDERS`; it is not automatically retried
 until its metadata is removed or reset.

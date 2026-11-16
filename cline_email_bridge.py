@@ -365,9 +365,12 @@ def process_one(
     retry_failed: bool,
     dry_run: bool,
 ) -> bool:
-    fetched = client.fetch([uid], ["RFC822"])
+    # BODY.PEEK[] does not set the \Seen flag. "RFC822" would, which marks the
+    # message read before Cline even starts and so defeats the "leave failed
+    # messages unread for inspection/retry" behaviour below.
+    fetched = client.fetch([uid], ["BODY.PEEK[]"])
     item = fetched.get(uid, {})
-    raw = item.get(b"RFC822") or item.get("RFC822")
+    raw = item.get(b"BODY[]") or item.get("BODY[]")
     if not raw:
         LOG.error("UID %s: server returned no RFC822 message", uid)
         return False
@@ -439,10 +442,25 @@ def process_one(
     metadata["runs"].append({"run": run_number, "started_at_utc": started, "directory": run_dir.name})
     save_metadata(metadata_path, metadata)
 
-    return_code, final_text, run_result = run_cline(
-        task_dir, metadata, run_dir, cline_bin, provider, model, workdir,
-        timeout, auto_approve,
-    )
+    try:
+        return_code, final_text, run_result = run_cline(
+            task_dir, metadata, run_dir, cline_bin, provider, model, workdir,
+            timeout, auto_approve,
+        )
+    except Exception as exc:
+        # e.g. FileNotFoundError when CLINE_BIN is not on the (cron) PATH: the
+        # process never started, so stdout/stderr stay empty. Record the reason
+        # in the run directory instead of leaving status="running" forever.
+        LOG.exception("UID %s: Cline could not be started", uid)
+        return_code = 127 if isinstance(exc, FileNotFoundError) else 1
+        run_result = None
+        final_text = (
+            f"Cline could not be started (exit code {return_code}): {exc!r}\n"
+            f"Check CLINE_BIN in the bridge .env and the PATH of the scheduling "
+            f"user (cron uses /usr/bin:/bin).\n"
+        )
+        with (run_dir / "stderr.log").open("a", encoding="utf-8") as stderr_file:
+            stderr_file.write(f"\nBridge: {exc!r}\n")
 
     (run_dir / "result.md").write_text(final_text.rstrip() + "\n", encoding="utf-8")
     metadata["runs"][-1].update({
@@ -477,6 +495,8 @@ def main() -> int:
                         help="Environment file (default: .env beside this script)")
     parser.add_argument("--limit", type=int, default=None, help="Maximum messages to process this run")
     parser.add_argument("--retry-failed", action="store_true", help="Retry messages whose previous Cline run failed")
+    parser.add_argument("--uid", type=int, action="append",
+                        help="Process this IMAP UID directly instead of searching UNSEEN (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="Save email/attachments but do not run Cline or mark messages read")
     args = parser.parse_args()
 
@@ -545,9 +565,13 @@ def main() -> int:
                 if processed_folder:
                     ensure_imap_folder(client, processed_folder)
 
-                uids = client.search(["UNSEEN"])
-                uids = sorted(uids)[:max_messages]
-                LOG.info("Found %d unseen message(s) in %s", len(uids), folder)
+                if args.uid:
+                    uids = sorted(set(args.uid))
+                    LOG.info("Processing %d explicitly selected UID(s) in %s", len(uids), folder)
+                else:
+                    uids = client.search(["UNSEEN"])
+                    uids = sorted(uids)[:max_messages]
+                    LOG.info("Found %d unseen message(s) in %s", len(uids), folder)
 
                 for uid in uids:
                     try:
